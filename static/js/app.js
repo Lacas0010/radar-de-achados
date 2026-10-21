@@ -34,7 +34,6 @@ document.addEventListener("DOMContentLoaded", () => {
     const toggleFiltersBtn = document.getElementById("toggle-filters-btn");
     const advancedFiltersPanel = document.getElementById("advanced-filters-panel");
     const filtersChevron = document.getElementById("filters-chevron");
-    const chipButtons = document.querySelectorAll(".chip-btn");
     const exportCsvBtn = document.getElementById("export-csv-btn");
     const exportJsonBtn = document.getElementById("export-json-btn");
     const viewGridBtn = document.getElementById("view-grid-btn");
@@ -74,16 +73,6 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    // Chips de sugestões rápidas
-    chipButtons.forEach(btn => {
-        btn.addEventListener("click", () => {
-            const query = btn.getAttribute("data-query");
-            if (query) {
-                queryInput.value = query;
-                searchForm.dispatchEvent(new Event("submit"));
-            }
-        });
-    });
 
     // Tabs de filtragem rápida (Shadcn Tabs)
     const tabButtons = document.querySelectorAll(".tab-filter-btn");

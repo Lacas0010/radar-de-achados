@@ -2,7 +2,7 @@ import re
 import json
 import urllib.parse
 from typing import List, Optional, Dict, Any
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 from models.item import Anuncio
 
 def parse_price(price_str: str) -> float:
@@ -19,10 +19,99 @@ def parse_price(price_str: str) -> float:
     except:
         return 0.0
 
+def extrair_ads_html(html_content: str, uf: str) -> List[Anuncio]:
+    """
+    Extrai anúncios do HTML renderizado da OLX (App Router / Next.js SSR),
+    analisando os cartões semânticos 'section.olx-adcard'.
+    """
+    soup = BeautifulSoup(html_content, "html.parser")
+    cards = soup.select("section.olx-adcard, [data-mode='horizontal'], div.olx-adcard")
+    if not cards:
+        cards = soup.find_all(
+            lambda tag: tag.name in ["section", "article", "div"] and tag.get("class") and any("adcard" in str(c).lower() for c in tag.get("class"))
+        )
+
+    anuncios: List[Anuncio] = []
+    seen_urls = set()
+
+    for c in cards:
+        a = c.select_one("a.olx-adcard__link") or c.select_one("a[data-testid='adcard-link']") or c.select_one("a[href]")
+        if not a or not a.get("href"):
+            continue
+
+        url = a.get("href", "").strip()
+        if not url or "desapega" in url:
+            continue
+        if not url.startswith("http"):
+            url = f"https://www.olx.com.br{url}"
+
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        # ID do anúncio a partir do sufixo numérico da URL
+        id_match = re.search(r'-(\d{7,12})', url)
+        ad_id = id_match.group(1) if id_match else None
+
+        # Título
+        title_elem = c.select_one(".olx-adcard__title") or c.select_one("h2") or a
+        title = a.get("title") or (title_elem.get_text(strip=True) if title_elem else "")
+        if not title:
+            continue
+
+        # Preço
+        price_elem = c.select_one(".olx-adcard__price") or c.select_one("h3")
+        price_text = price_elem.get_text(strip=True) if price_elem else ""
+        if not price_text:
+            p_match = re.search(r'R\$\s*[\d\.]+(?:,\d{2})?', c.get_text())
+            price_text = p_match.group(0) if p_match else "0"
+        price_num = parse_price(price_text)
+
+        # Localização
+        loc_elem = c.select_one(".olx-adcard__location")
+        location = loc_elem.get_text(strip=True) if loc_elem else f"Estado {uf.upper()}"
+
+        # Data de publicação
+        date_elem = c.select_one(".olx-adcard__date")
+        date_post = date_elem.get_text(strip=True) if date_elem else None
+
+        # Imagem primária
+        img_url = ""
+        img = c.find("img")
+        if img:
+            img_url = img.get("src") or img.get("data-src") or ""
+            if (not img_url or img_url.startswith("data:")) and img.get("srcset"):
+                parts = img.get("srcset").split(",")
+                img_url = parts[-1].strip().split(" ")[0]
+        if not img_url:
+            source = c.find("source")
+            if source and source.get("srcset"):
+                parts = source.get("srcset").split(",")
+                img_url = parts[-1].strip().split(" ")[0]
+
+        if img_url and (img_url.startswith("data:") or not img_url.startswith("http")):
+            img_url = None
+
+        images_list = [img_url] if img_url else []
+
+        anuncio = Anuncio(
+            titulo=title,
+            preco=price_num,
+            localizacao=location,
+            url=url,
+            plataforma="OLX",
+            imagem_url=img_url,
+            imagens=images_list,
+            data_publicacao=date_post,
+            id=f"olx_{ad_id}" if ad_id else None
+        )
+        anuncios.append(anuncio)
+
+    return anuncios
+
 def extrair_ads_next_data(html_content: str, uf: str) -> List[Anuncio]:
     """
-    Extrai o payload JSON do __NEXT_DATA__ via regex no HTML cru da requisição,
-    sem aguardar seletores visuais ou renderização DOM.
+    Fallback legado: Extrai o payload JSON do __NEXT_DATA__ caso presente.
     """
     anuncios: List[Anuncio] = []
     match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html_content, re.DOTALL)
@@ -31,22 +120,17 @@ def extrair_ads_next_data(html_content: str, uf: str) -> List[Anuncio]:
 
     try:
         data = json.loads(match.group(1))
-        # Navega na árvore do Next.js
         page_props = data.get("props", {}).get("pageProps", {})
         ads_raw = page_props.get("ads", [])
-        
-        # Algumas versões da OLX usam initialReduxState ou searchResult
+
         if not ads_raw:
             ads_raw = page_props.get("searchResult", {}).get("ads", [])
-            
+
         if not ads_raw and "initialReduxState" in page_props:
             redux = page_props.get("initialReduxState", {})
             ads_raw = redux.get("adList", {}).get("ads", [])
 
-        print(f"[OLX API Direct] Encontrados {len(ads_raw)} anúncios no payload __NEXT_DATA__")
-
         for ad in ads_raw:
-            # Ignora banners ou anúncios de terceiros
             if ad.get("isAdverts") or not ad.get("subject"):
                 continue
 
@@ -56,13 +140,11 @@ def extrair_ads_next_data(html_content: str, uf: str) -> List[Anuncio]:
 
             raw_price = ad.get("price") or ad.get("priceValue") or ad.get("formattedPrice") or "0"
             price = parse_price(str(raw_price))
-            
-            # URL
+
             url = ad.get("url") or ""
             if url and not url.startswith("http"):
                 url = f"https://www.olx.com.br{url}"
 
-            # Extração da galeria completa de imagens
             images_list = []
             raw_images = ad.get("images", [])
             for img_item in raw_images:
@@ -75,7 +157,6 @@ def extrair_ads_next_data(html_content: str, uf: str) -> List[Anuncio]:
 
             primary_img = images_list[0] if images_list else None
 
-            # Localização detalhada
             location_parts = []
             loc_obj = ad.get("location", {})
             if isinstance(loc_obj, dict):
@@ -85,7 +166,7 @@ def extrair_ads_next_data(html_content: str, uf: str) -> List[Anuncio]:
                     location_parts.append(loc_obj.get("municipality"))
                 if loc_obj.get("uf"):
                     location_parts.append(loc_obj.get("uf"))
-            
+
             location_str = ", ".join(location_parts) if location_parts else (ad.get("locationText") or f"Estado {uf.upper()}")
             date_pub = ad.get("date") or ad.get("displayDate") or None
 
@@ -106,6 +187,114 @@ def extrair_ads_next_data(html_content: str, uf: str) -> List[Anuncio]:
 
     return anuncios
 
+def _build_olx_url(termo: str, uf: str, preco_min: float = 0.0, preco_max: Optional[float] = None, page_num: int = 1) -> str:
+    uf_clean = uf.lower().strip()
+    encoded_query = urllib.parse.quote_plus(termo.strip())
+    url_base = f"https://www.olx.com.br/estado-{uf_clean}" if uf_clean != "brasil" else "https://www.olx.com.br/brasil"
+    params = [f"q={encoded_query}"]
+
+    if preco_min and preco_min > 0:
+        params.append(f"ps={int(preco_min)}")
+    if preco_max and preco_max > 0:
+        params.append(f"pe={int(preco_max)}")
+    if page_num > 1:
+        params.append(f"o={page_num}")
+
+    return f"{url_base}?{'&'.join(params)}"
+
+def scrape_olx_curl(
+    termo: str,
+    uf: str = "sp",
+    preco_min: float = 0.0,
+    preco_max: Optional[float] = None,
+    max_items: int = 40
+) -> List[Anuncio]:
+    """
+    Busca rápida via curl_cffi com personificação de Chrome (TLS JA3/JA4 real).
+    Bypassa Cloudflare e extrai anúncios diretamente do SSR da OLX em ~1.5s.
+    """
+    from curl_cffi import requests as cffi_requests
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1"
+    }
+
+    anuncios: List[Anuncio] = []
+    page = 1
+    max_pages = 2 if max_items > 45 else 1
+
+    while len(anuncios) < max_items and page <= max_pages:
+        url = _build_olx_url(termo, uf, preco_min, preco_max, page_num=page)
+        print(f"[OLX TLS-Stealth] Conectando a {url} (pág {page})...")
+
+        resp = cffi_requests.get(url, impersonate="chrome124", headers=headers, timeout=12)
+        if resp.status_code != 200:
+            print(f"[OLX TLS-Stealth] Status HTTP {resp.status_code} na página {page}.")
+            break
+
+        html = resp.text
+        # Tenta extração via HTML moderno primeiro
+        novos = extrair_ads_html(html, uf=uf)
+        if not novos:
+            # Fallback para Next Data se houver
+            novos = extrair_ads_next_data(html, uf=uf)
+
+        if not novos:
+            print(f"[OLX TLS-Stealth] Nenhum anúncio retornado na página {page}.")
+            break
+
+        anuncios.extend(novos)
+        page += 1
+
+    return anuncios[:max_items]
+
+def scrape_olx_playwright(
+    termo: str,
+    uf: str = "sp",
+    preco_min: float = 0.0,
+    preco_max: Optional[float] = None,
+    max_items: int = 40
+) -> List[Anuncio]:
+    """
+    Fallback secundário usando Playwright Chromium com scripts stealth.
+    """
+    from playwright.sync_api import sync_playwright
+    from core.stealth import STEALTH_LAUNCH_ARGS, get_stealth_context_options, apply_stealth_to_page
+
+    url = _build_olx_url(termo, uf, preco_min, preco_max, page_num=1)
+    print(f"[OLX Playwright Fallback] Acessando URL: {url}")
+    anuncios: List[Anuncio] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=STEALTH_LAUNCH_ARGS
+        )
+        context = browser.new_context(**get_stealth_context_options())
+        page = context.new_page()
+        apply_stealth_to_page(page)
+
+        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        page.wait_for_timeout(1500)
+
+        html_raw = page.content()
+        browser.close()
+
+        anuncios = extrair_ads_html(html_raw, uf=uf)
+        if not anuncios:
+            anuncios = extrair_ads_next_data(html_raw, uf=uf)
+
+    return anuncios[:max_items]
+
 def scrape_olx(
     termo: str,
     uf: str = "sp",
@@ -114,140 +303,26 @@ def scrape_olx(
     max_items: int = 40
 ) -> List[Anuncio]:
     """
-    Extrai anúncios da OLX Brasil com bypass de renderização DOM através
-    do payload JSON direto do __NEXT_DATA__, com fallback seguro para DOM.
+    Função principal de busca na OLX Brasil.
+    Prioriza o scraper TLS-Stealth via curl_cffi (bypass total de Cloudflare e resposta ultrarrápida),
+    com fallback automático para Playwright caso necessário.
     """
-    uf_clean = uf.lower().strip()
-    encoded_query = urllib.parse.quote_plus(termo.strip())
-    
-    url_base = f"https://www.olx.com.br/estado-{uf_clean}" if uf_clean != "brasil" else "https://www.olx.com.br/brasil"
-    params = [f"q={encoded_query}"]
-    
-    if preco_min and preco_min > 0:
-        params.append(f"ps={int(preco_min)}")
-    if preco_max and preco_max > 0:
-        params.append(f"pe={int(preco_max)}")
-        
-    url = f"{url_base}?{'&'.join(params)}"
-    print(f"[OLX] Acessando URL: {url}")
-    
     anuncios: List[Anuncio] = []
-    
+
+    # 1. Tentativa Primária: TLS Fingerprint Real (Bypass de Cloudflare)
     try:
-        from core.stealth import STEALTH_LAUNCH_ARGS, get_stealth_context_options, apply_stealth_to_page
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=STEALTH_LAUNCH_ARGS
-            )
-            context = browser.new_context(**get_stealth_context_options())
-            page = context.new_page()
-            apply_stealth_to_page(page)
-            
-            # Navega na página
-            page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            
-            # 1. TENTATIVA RÁPIDA: Interceptação Direta de API (__NEXT_DATA__)
-            html_raw = page.content()
-            direct_ads = extrair_ads_next_data(html_raw, uf=uf_clean)
-            
-            if direct_ads:
-                anuncios = direct_ads[:max_items]
-                browser.close()
-                print(f"[OLX] Sucesso via __NEXT_DATA__: {len(anuncios)} anúncios extraídos com galeria completa.")
-                return anuncios
-
-            # 2. FALLBACK SEGURO: Extração via DOM se __NEXT_DATA__ não estiver presente
-            print("[OLX] __NEXT_DATA__ não detectado. Ativando fallback DOM com scroll...")
-            page.wait_for_timeout(1500)
-            for _ in range(4):
-                page.mouse.wheel(0, 1000)
-                page.wait_for_timeout(350)
-
-            raw_cards = page.evaluate("""() => {
-                const results = [];
-                const sections = document.querySelectorAll('section');
-                for (const s of sections) {
-                    const a = s.querySelector('a[data-testid="adcard-link"]') || s.querySelector('a');
-                    if (!a || !a.href || a.href.includes('desapega') || !a.href.includes('olx.com.br')) continue;
-                    
-                    const text = s.innerText || '';
-                    const match = text.match(/R\\$\\s*([\\d\\.]+)/);
-                    if (!match) continue;
-                    
-                    const h2 = s.querySelector('h2');
-                    const title = (h2 ? h2.innerText : (a.title || '')).trim();
-                    if (!title) continue;
-                    
-                    let imgSrc = '';
-                    const pictureSource = s.querySelector('picture source');
-                    if (pictureSource && pictureSource.getAttribute('srcset')) {
-                        const parts = pictureSource.getAttribute('srcset').split(',');
-                        imgSrc = parts[parts.length - 1].trim().split(' ')[0];
-                    }
-                    if (!imgSrc || !imgSrc.startsWith('http')) {
-                        const img = s.querySelector('img');
-                        if (img) {
-                            imgSrc = img.currentSrc || img.src || img.getAttribute('data-src') || '';
-                            if ((!imgSrc || imgSrc.startsWith('data:')) && img.getAttribute('srcset')) {
-                                const parts = img.getAttribute('srcset').split(',');
-                                imgSrc = parts[parts.length - 1].trim().split(' ')[0];
-                            }
-                        }
-                    }
-                    if (imgSrc && (imgSrc.startsWith('data:') || !imgSrc.startsWith('http'))) {
-                        imgSrc = '';
-                    }
-                    
-                    const lines = text.split('\\n').map(l => l.trim()).filter(Boolean);
-                    let loc = '';
-                    let datePost = '';
-                    for (const l of lines) {
-                        if (l.includes('Hoje,') || l.includes('Ontem,') || /\\d{1,2}\\/\\d{1,2}/.test(l)) {
-                            datePost = l;
-                        } else if ((l.includes(',') || l.includes(' - ')) && !l.includes('R$') && !l.includes('juros') && !l.includes('Frete') && !l.includes('Entrega')) {
-                            loc = l;
-                        }
-                    }
-                    
-                    results.push({
-                        titulo: title,
-                        preco_texto: match[0],
-                        url: a.href,
-                        imagem_url: imgSrc,
-                        localizacao: loc,
-                        data_publicacao: datePost
-                    });
-                }
-                return results;
-            }""")
-
-            browser.close()
-
-            seen_urls = set()
-            for r in raw_cards:
-                u = r["url"]
-                if u in seen_urls:
-                    continue
-                seen_urls.add(u)
-                
-                num_preco = parse_price(r["preco_texto"])
-                anuncio = Anuncio(
-                    titulo=r["titulo"],
-                    preco=num_preco,
-                    localizacao=r["localizacao"] or f"Estado {uf.upper()}",
-                    url=u,
-                    plataforma="OLX",
-                    imagem_url=r["imagem_url"] or None,
-                    imagens=[r["imagem_url"]] if r["imagem_url"] else [],
-                    data_publicacao=r["data_publicacao"] or None
-                )
-                anuncios.append(anuncio)
-                if len(anuncios) >= max_items:
-                    break
-
+        anuncios = scrape_olx_curl(termo, uf, preco_min, preco_max, max_items)
+        if anuncios:
+            print(f"[OLX] Sucesso via TLS-Stealth: {len(anuncios)} anúncios extraídos.")
+            return anuncios
     except Exception as e:
-        print(f"[OLX] Erro ao extrair anúncios: {e}")
+        print(f"[OLX] Falha no método TLS-Stealth: {e}. Acionando fallback Playwright...")
 
-    print(f"[OLX] Sucesso: {len(anuncios)} anúncios extraídos.")
+    # 2. Fallback Secundário: Playwright com stealth
+    try:
+        anuncios = scrape_olx_playwright(termo, uf, preco_min, preco_max, max_items)
+        print(f"[OLX] Sucesso via Playwright Fallback: {len(anuncios)} anúncios extraídos.")
+    except Exception as e:
+        print(f"[OLX] Falha no fallback Playwright: {e}")
+
     return anuncios
